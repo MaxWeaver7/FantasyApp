@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -403,6 +404,7 @@ def _dict_rows(cur: sqlite3.Cursor) -> list[dict[str, Any]]:
 
 class Handler(BaseHTTPRequestHandler):
     db_path: Path
+    dist_path: Path
 
     def _send(self, code: int, body: bytes, content_type: str) -> None:
         self.send_response(code)
@@ -419,12 +421,192 @@ class Handler(BaseHTTPRequestHandler):
         c = sqlite3.connect(str(self.db_path))
         c.row_factory = sqlite3.Row
         return c
+    
+    def _serve_static_file(self, file_path: Path) -> None:
+        """Serve a static file from the dist directory."""
+        try:
+            with open(file_path, 'rb') as f:
+                content = f.read()
+            
+            # Determine content type
+            content_type, _ = mimetypes.guess_type(str(file_path))
+            if content_type is None:
+                content_type = 'application/octet-stream'
+            
+            self._send(200, content, content_type)
+        except FileNotFoundError:
+            self._json({"error": "File not found"}, code=404)
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
 
+        def q_int(name: str) -> Optional[int]:
+            raw = qs.get(name, [None])[0]
+            if raw in (None, "", "null"):
+                return None
+            try:
+                return int(raw)
+            except ValueError:
+                return None
+
+        def q_str(name: str) -> Optional[str]:
+            raw = qs.get(name, [None])[0]
+            if raw in (None, "", "null"):
+                return None
+            return str(raw)
+
+        # API endpoints
+        if path == "/api/summary":
+            with self._conn() as conn:
+                s = queries.summary(conn)
+            s["db_path"] = str(self.db_path)
+            self._json(s)
+            return
+
+        if path == "/api/options":
+            with self._conn() as conn:
+                self._json(queries.options(conn))
+            return
+
+        if path == "/api/players":
+            with self._conn() as conn:
+                players = queries.get_players_list(
+                    conn,
+                    season=q_int("season"),
+                    position=q_str("position"),
+                    team=q_str("team"),
+                    limit=int(qs.get("limit", ["100"])[0]),
+                )
+            # Attach photoUrl (GSIS -> ESPN/Sleeper) for the UI
+            for p in players:
+                p["photoUrl"] = queries.player_photo_url(p.get("player_id", ""))  # type: ignore[arg-type]
+                # Normalize naming to what the frontend expects
+                if "player_position" in p and "position" not in p:
+                    p["position"] = p.get("player_position")
+            self._json({"players": players})
+            return
+
+        if path.startswith("/api/player/"):
+            player_id = path.split("/api/player/", 1)[1].strip()
+            season = q_int("season")
+            if not player_id or not season:
+                self._json({"error": "missing player_id or season"}, code=400)
+                return
+            with self._conn() as conn:
+                # Get player info
+                cur = conn.cursor()
+                player_row = cur.execute(
+                    """SELECT player_id, player_name, position, team_abbr as team 
+                       FROM players WHERE player_id = ?""",
+                    (player_id,),
+                ).fetchone()
+                
+                if not player_row:
+                    self._json({"error": "player not found"}, code=404)
+                    return
+                
+                player = dict(player_row)
+                
+                # Get season totals
+                season_stats = queries.get_players_list(
+                    conn, season=season, position=None, team=None, limit=1000
+                )
+                player_season = next((p for p in season_stats if p['player_id'] == player_id), None)
+                
+                if player_season:
+                    # Prefer derived team/position from season aggregates (players table may be sparse)
+                    player["team"] = player_season.get("team")
+                    player["position"] = player_season.get("player_position") or player.get("position")
+                    player.update({
+                        'seasonTotals': {
+                            'season': season,
+                            'games': player_season.get('games', 0),
+                            'targets': player_season.get('targets', 0),
+                            'receptions': player_season.get('receptions', 0),
+                            'receivingYards': player_season.get('receivingYards', 0),
+                            'receivingTouchdowns': player_season.get('receivingTouchdowns', 0),
+                            'avgYardsPerCatch': player_season.get('avgYardsPerCatch', 0),
+                            'rushAttempts': player_season.get('rushAttempts', 0),
+                            'rushingYards': player_season.get('rushingYards', 0),
+                            'rushingTouchdowns': player_season.get('rushingTouchdowns', 0),
+                            'avgYardsPerRush': player_season.get('avgYardsPerRush', 0),
+                        }
+                    })
+                # Photo URL for the hero + card
+                player["photoUrl"] = queries.player_photo_url(player_id)
+                
+                # Get game logs
+                game_logs = queries.get_player_game_logs(conn, player_id, season)
+                
+            self._json({"player": player, "gameLogs": game_logs})
+            return
+
+        if path == "/api/receiving_dashboard":
+            limit = int(qs.get("limit", ["25"])[0])
+            with self._conn() as conn:
+                rows = queries.player_game_receiving(
+                    conn,
+                    season=q_int("season"),
+                    week=q_int("week"),
+                    team=q_str("team"),
+                    limit=limit,
+                )
+            for r in rows:
+                r["photoUrl"] = queries.player_photo_url(r.get("player_id", ""))  # type: ignore[arg-type]
+                # players table can be sparse; receiving leaderboards are overwhelmingly WR/TE/RB
+                r["position"] = r.get("position") if r.get("position") not in (None, "", "UNK") else "WR"
+            self._json({"rows": rows})
+            return
+
+        if path == "/api/rushing_dashboard":
+            limit = int(qs.get("limit", ["25"])[0])
+            with self._conn() as conn:
+                rows = queries.player_game_rushing(
+                    conn,
+                    season=q_int("season"),
+                    week=q_int("week"),
+                    team=q_str("team"),
+                    limit=limit,
+                )
+            for r in rows:
+                r["photoUrl"] = queries.player_photo_url(r.get("player_id", ""))  # type: ignore[arg-type]
+                r["position"] = r.get("position") if r.get("position") not in (None, "", "UNK") else "RB"
+            self._json({"rows": rows})
+            return
+
+        if path == "/api/receiving_season":
+            limit = int(qs.get("limit", ["25"])[0])
+            with self._conn() as conn:
+                rows = queries.season_receiving(
+                    conn,
+                    season=q_int("season"),
+                    team=q_str("team"),
+                    limit=limit,
+                )
+            for r in rows:
+                r["photoUrl"] = queries.player_photo_url(r.get("player_id", ""))  # type: ignore[arg-type]
+                r["position"] = r.get("position") if r.get("position") not in (None, "", "UNK") else "WR"
+            self._json({"rows": rows})
+            return
+
+        if path == "/api/rushing_season":
+            limit = int(qs.get("limit", ["25"])[0])
+            with self._conn() as conn:
+                rows = queries.season_rushing(
+                    conn,
+                    season=q_int("season"),
+                    team=q_str("team"),
+                    limit=limit,
+                )
+            for r in rows:
+                r["photoUrl"] = queries.player_photo_url(r.get("player_id", ""))  # type: ignore[arg-type]
+                r["position"] = r.get("position") if r.get("position") not in (None, "", "UNK") else "RB"
+            self._json({"rows": rows})
+            return
+
+        # Legacy endpoints for old UI
         if path.startswith("/player/"):
             player_id = path.split("/player/", 1)[1].strip()
             if not player_id:
@@ -447,85 +629,30 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        # Serve React app
+        if self.dist_path.exists():
+            # Serve index.html for root or any non-asset path (SPA routing)
+            if path == "/" or path == "/index.html":
+                index_file = self.dist_path / "index.html"
+                if index_file.exists():
+                    self._serve_static_file(index_file)
+                    return
+            
+            # Serve static assets
+            requested_file = self.dist_path / path.lstrip('/')
+            if requested_file.exists() and requested_file.is_file():
+                self._serve_static_file(requested_file)
+                return
+            
+            # Fallback to index.html for SPA routing
+            index_file = self.dist_path / "index.html"
+            if index_file.exists():
+                self._serve_static_file(index_file)
+                return
+
+        # Fallback to old UI if dist doesn't exist
         if path == "/" or path == "/index.html":
             self._send(200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
-            return
-
-        if path == "/api/summary":
-            with self._conn() as conn:
-                s = queries.summary(conn)
-            s["db_path"] = str(self.db_path)
-            self._json(s)
-            return
-
-        if path == "/api/options":
-            with self._conn() as conn:
-                self._json(queries.options(conn))
-            return
-
-        def q_int(name: str) -> Optional[int]:
-            raw = qs.get(name, [None])[0]
-            if raw in (None, "", "null"):
-                return None
-            try:
-                return int(raw)
-            except ValueError:
-                return None
-
-        def q_str(name: str) -> Optional[str]:
-            raw = qs.get(name, [None])[0]
-            if raw in (None, "", "null"):
-                return None
-            return str(raw)
-
-        if path == "/api/receiving_dashboard":
-            limit = int(qs.get("limit", ["25"])[0])
-            with self._conn() as conn:
-                rows = queries.player_game_receiving(
-                    conn,
-                    season=q_int("season"),
-                    week=q_int("week"),
-                    team=q_str("team"),
-                    limit=limit,
-                )
-            self._json({"rows": rows})
-            return
-
-        if path == "/api/rushing_dashboard":
-            limit = int(qs.get("limit", ["25"])[0])
-            with self._conn() as conn:
-                rows = queries.player_game_rushing(
-                    conn,
-                    season=q_int("season"),
-                    week=q_int("week"),
-                    team=q_str("team"),
-                    limit=limit,
-                )
-            self._json({"rows": rows})
-            return
-
-        if path == "/api/receiving_season":
-            limit = int(qs.get("limit", ["25"])[0])
-            with self._conn() as conn:
-                rows = queries.season_receiving(
-                    conn,
-                    season=q_int("season"),
-                    team=q_str("team"),
-                    limit=limit,
-                )
-            self._json({"rows": rows})
-            return
-
-        if path == "/api/rushing_season":
-            limit = int(qs.get("limit", ["25"])[0])
-            with self._conn() as conn:
-                rows = queries.season_rushing(
-                    conn,
-                    season=q_int("season"),
-                    team=q_str("team"),
-                    limit=limit,
-                )
-            self._json({"rows": rows})
             return
 
         self._json({"error": "not found", "path": path}, code=404)
@@ -804,8 +931,14 @@ class Handler(BaseHTTPRequestHandler):
 
 def run(db_path: str, host: str, port: int) -> None:
     Handler.db_path = Path(db_path).resolve()
+    Handler.dist_path = Path(__file__).parent.parent.parent / "dist"
     server = ThreadingHTTPServer((host, port), Handler)
-    print(f"Serving DB viewer at http://{host}:{port}/ (db={Handler.db_path})")
+    
+    ui_type = "React UI" if Handler.dist_path.exists() else "Legacy UI"
+    print(f"Serving {ui_type} at http://{host}:{port}/ (db={Handler.db_path})")
+    if Handler.dist_path.exists():
+        print(f"Static files from: {Handler.dist_path}")
+    
     server.serve_forever()
 
 

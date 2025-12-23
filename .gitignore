@@ -17,15 +17,17 @@ build/
 .idea/
 .vscode/
 
+# Node
+node_modules/
+
 # Tests
 .pytest_cache/
 .coverage
 htmlcov/
 
-# Data artifacts (do not commit)
-data/**/*.db
-data/**/*.db-*
-data/pfr_cache/
+# Data artifacts
+# NOTE: This repo intentionally commits the SQLite DB for reproducibility (private repo).
+# If you want to go back to keeping DB local-only, re-add ignores for `data/**/*.db*`.
 
 # Logs
 *.log
