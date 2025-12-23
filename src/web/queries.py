@@ -3,6 +3,64 @@ from __future__ import annotations
 import sqlite3
 from typing import Any, Optional
 
+from functools import lru_cache
+from pathlib import Path
+
+import pandas as pd  # type: ignore
+import requests
+
+
+_PLAYER_IDS_URL = "https://raw.githubusercontent.com/dynastyprocess/data/master/files/db_playerids.csv"
+
+
+@lru_cache(maxsize=1)
+def _player_ids_df() -> "pd.DataFrame":
+    """
+    Load a GSIS->(ESPN/NFL/Sleeper/...) id mapping.
+
+    Why: our DB uses GSIS ids like `00-0036900`, but most headshot CDNs require
+    ESPN id (numeric) or Sleeper id. We fetch the canonical dynastyprocess map
+    (same dataset used widely in the NFL analytics ecosystem) and cache it to disk.
+    """
+    repo_root = Path(__file__).resolve().parents[2]  # hrb/
+    cache_path = repo_root / "data" / "db_playerids.csv"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not cache_path.exists():
+        resp = requests.get(_PLAYER_IDS_URL, timeout=30)
+        resp.raise_for_status()
+        cache_path.write_bytes(resp.content)
+
+    # Ensure ids stay strings (espn_id often numeric, but keep as string)
+    return pd.read_csv(cache_path, dtype=str)
+
+
+def player_photo_url(player_id: str) -> Optional[str]:
+    """
+    Best-effort player headshot URL for a GSIS player_id.
+    Prefers ESPN (high quality) then Sleeper.
+    """
+    try:
+        df = _player_ids_df()
+    except Exception:
+        return None
+
+    if "gsis_id" not in df.columns:
+        return None
+
+    row = df[df["gsis_id"] == player_id]
+    if row.empty:
+        return None
+
+    rec = row.iloc[0].to_dict()
+    espn_id = (rec.get("espn_id") or "").strip()
+    sleeper_id = (rec.get("sleeper_id") or "").strip()
+
+    if espn_id and espn_id.lower() != "nan":
+        return f"https://a.espncdn.com/i/headshots/nfl/players/full/{espn_id}.png"
+    if sleeper_id and sleeper_id.lower() != "nan":
+        return f"https://sleepercdn.com/content/nfl/players/{sleeper_id}.jpg"
+    return None
 
 def dict_rows(cur: sqlite3.Cursor) -> list[dict[str, Any]]:
     cols = [c[0] for c in cur.description] if cur.description else []
@@ -11,10 +69,11 @@ def dict_rows(cur: sqlite3.Cursor) -> list[dict[str, Any]]:
 
 def options(conn: sqlite3.Connection) -> dict[str, Any]:
     cur = conn.cursor()
-    seasons = [r[0] for r in cur.execute("SELECT DISTINCT season FROM games ORDER BY season").fetchall()]
+    seasons = [r[0] for r in cur.execute("SELECT DISTINCT season FROM games ORDER BY season DESC").fetchall()]
     weeks = [r[0] for r in cur.execute("SELECT DISTINCT week FROM games ORDER BY week").fetchall()]
     teams = [r[0] for r in cur.execute("SELECT team_abbr FROM teams WHERE team_abbr IS NOT NULL ORDER BY team_abbr").fetchall()]
-    return {"seasons": seasons, "weeks": weeks, "teams": teams}
+    positions = ['QB', 'RB', 'WR', 'TE']
+    return {"seasons": seasons, "weeks": weeks, "teams": teams, "positions": positions}
 
 
 def summary(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -286,6 +345,180 @@ def team_game_summary(
     params.append(limit)
     cur = conn.cursor()
     cur.execute(sql, params)
+    return dict_rows(cur)
+
+
+def get_players_list(
+    conn: sqlite3.Connection,
+    *,
+    season: Optional[int],
+    position: Optional[str],
+    team: Optional[str],
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Get list of players with season totals for filtering and display."""
+    where = ["1=1"]
+    params: list[Any] = []
+    
+    if season is not None:
+        where.append("season = ?")
+        params.append(season)
+    if position:
+        where.append("player_position = ?")
+        params.append(position)
+    if team:
+        where.append("team = ?")
+        params.append(team)
+
+    # Derive position from play types - receivers get WR, rushers get RB
+    sql = f"""
+    WITH recv_stats AS (
+        SELECT 
+            receiver_id AS player_id,
+            posteam AS team,
+            season,
+            COUNT(DISTINCT game_id) AS games,
+            COUNT(*) AS targets,
+            SUM(CASE WHEN complete_pass = 1 THEN 1 ELSE 0 END) AS receptions,
+            SUM(CASE WHEN complete_pass = 1 THEN COALESCE(yards_gained, 0) ELSE 0 END) AS rec_yards,
+            0 AS rec_tds
+        FROM plays
+        WHERE receiver_id IS NOT NULL AND TRIM(receiver_id) != ''
+        GROUP BY receiver_id, posteam, season
+    ),
+    rush_stats AS (
+        SELECT 
+            rusher_id AS player_id,
+            posteam AS team,
+            season,
+            COUNT(DISTINCT game_id) AS games,
+            COUNT(*) AS attempts,
+            SUM(COALESCE(yards_gained, 0)) AS yards,
+            0 AS tds
+        FROM plays
+        WHERE rusher_id IS NOT NULL AND TRIM(rusher_id) != '' AND rush = 1
+        GROUP BY rusher_id, posteam, season
+    ),
+    all_players AS (
+        SELECT player_id, team, season FROM recv_stats
+        UNION
+        SELECT player_id, team, season FROM rush_stats
+    ),
+    player_stats AS (
+        SELECT 
+            ap.player_id,
+            COALESCE(p.player_name, ap.player_id) AS player_name,
+            CASE 
+                WHEN COALESCE(recv.targets, 0) > 50 AND COALESCE(rush.attempts, 0) < 50 THEN 'WR'
+                WHEN COALESCE(rush.attempts, 0) > 50 AND COALESCE(recv.targets, 0) < 50 THEN 'RB'
+                WHEN COALESCE(recv.targets, 0) > 30 AND COALESCE(rush.attempts, 0) > 30 THEN 'RB'
+                WHEN COALESCE(recv.targets, 0) >= 20 THEN 'WR'
+                WHEN COALESCE(rush.attempts, 0) >= 20 THEN 'RB'
+                ELSE 'RB'
+            END AS player_position,
+            ap.team,
+            ap.season,
+            MAX(COALESCE(recv.games, 0), COALESCE(rush.games, 0)) AS games,
+            COALESCE(recv.targets, 0) AS targets,
+            COALESCE(recv.receptions, 0) AS receptions,
+            COALESCE(recv.rec_yards, 0) AS receivingYards,
+            COALESCE(recv.rec_tds, 0) AS receivingTouchdowns,
+            CASE WHEN COALESCE(recv.receptions, 0) > 0 
+                THEN ROUND(CAST(COALESCE(recv.rec_yards, 0) AS REAL) / recv.receptions, 1) 
+                ELSE 0 END AS avgYardsPerCatch,
+            COALESCE(rush.attempts, 0) AS rushAttempts,
+            COALESCE(rush.yards, 0) AS rushingYards,
+            COALESCE(rush.tds, 0) AS rushingTouchdowns,
+            CASE WHEN COALESCE(rush.attempts, 0) > 0 
+                THEN ROUND(CAST(COALESCE(rush.yards, 0) AS REAL) / rush.attempts, 1) 
+                ELSE 0 END AS avgYardsPerRush
+        FROM all_players ap
+        LEFT JOIN recv_stats recv ON recv.player_id = ap.player_id AND recv.season = ap.season AND recv.team = ap.team
+        LEFT JOIN rush_stats rush ON rush.player_id = ap.player_id AND rush.season = ap.season AND rush.team = ap.team
+        LEFT JOIN players p ON p.player_id = ap.player_id
+    )
+    SELECT * FROM player_stats
+    WHERE {" AND ".join(where)}
+    ORDER BY 
+        CASE 
+            WHEN player_position IN ('WR', 'TE') THEN receivingYards
+            WHEN player_position = 'RB' THEN rushingYards + receivingYards
+            ELSE rushingYards
+        END DESC
+    LIMIT ?
+    """
+    params.append(limit)
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    return dict_rows(cur)
+
+
+def get_player_game_logs(
+    conn: sqlite3.Connection,
+    player_id: str,
+    season: int,
+) -> list[dict[str, Any]]:
+    """Get game-by-game stats for a player in a specific season."""
+    sql = """
+    WITH game_stats AS (
+        SELECT 
+            p.season,
+            p.week,
+            p.game_id,
+            p.posteam AS team,
+            g.gameday,
+            g.home_team,
+            g.away_team,
+            CASE WHEN p.posteam = g.home_team THEN 'home' ELSE 'away' END AS location,
+            CASE WHEN p.posteam = g.home_team THEN g.away_team ELSE g.home_team END AS opponent,
+            COUNT(CASE WHEN p.receiver_id = ? THEN 1 END) AS targets,
+            SUM(CASE WHEN p.receiver_id = ? AND p.complete_pass = 1 THEN 1 ELSE 0 END) AS receptions,
+            SUM(CASE WHEN p.receiver_id = ? AND p.complete_pass = 1 THEN COALESCE(p.yards_gained, 0) ELSE 0 END) AS rec_yards,
+            0 AS rec_tds,
+            SUM(CASE WHEN p.receiver_id = ? THEN COALESCE(p.air_yards, 0) ELSE 0 END) AS air_yards,
+            SUM(CASE WHEN p.receiver_id = ? AND p.complete_pass = 1 THEN COALESCE(p.yards_after_catch, 0) ELSE 0 END) AS yac,
+            ROUND(
+                SUM(CASE WHEN p.receiver_id = ? THEN COALESCE(p.epa, 0) ELSE 0 END)
+                / NULLIF(COUNT(CASE WHEN p.receiver_id = ? THEN 1 END), 0),
+                3
+            ) AS epa_per_target,
+            COUNT(CASE WHEN p.rusher_id = ? AND p.rush = 1 THEN 1 END) AS rush_attempts,
+            SUM(CASE WHEN p.rusher_id = ? AND p.rush = 1 THEN COALESCE(p.yards_gained, 0) ELSE 0 END) AS rush_yards,
+            0 AS rush_tds,
+            ROUND(
+                SUM(CASE WHEN p.rusher_id = ? AND p.rush = 1 THEN COALESCE(p.epa, 0) ELSE 0 END)
+                / NULLIF(COUNT(CASE WHEN p.rusher_id = ? AND p.rush = 1 THEN 1 END), 0),
+                3
+            ) AS epa_per_rush
+        FROM plays p
+        JOIN games g ON g.game_id = p.game_id
+        WHERE p.season = ? AND (p.receiver_id = ? OR p.rusher_id = ?)
+        GROUP BY p.game_id, p.week, p.posteam
+        ORDER BY p.week
+    )
+    SELECT * FROM game_stats
+    """
+    cur = conn.cursor()
+    # params map to each ? in order
+    cur.execute(
+        sql,
+        [
+            player_id,  # targets count
+            player_id,  # receptions
+            player_id,  # rec_yards
+            player_id,  # air_yards
+            player_id,  # yac
+            player_id,  # epa sum
+            player_id,  # epa denom count
+            player_id,  # rush_attempts
+            player_id,  # rush_yards
+            player_id,  # epa rush sum
+            player_id,  # epa rush denom count
+            season,
+            player_id,
+            player_id,
+        ],
+    )
     return dict_rows(cur)
 
 
